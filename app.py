@@ -168,3 +168,10 @@ def debug_pass(code):
             return jsonify({"cards": cards, "supabase_key_len": len(SUPABASE_KEY), "openssl": shutil.which("openssl")})
     except Exception as e:
         return jsonify({"error": str(e), "trace": traceback.format_exc()})
+
+@app.route("/openssl-version")
+def openssl_version():
+    import subprocess, shutil
+    cmd = shutil.which("openssl")
+    r = subprocess.run([cmd, "version"], capture_output=True)
+    return jsonify({"version": r.stdout.decode().strip(), "path": cmd})
