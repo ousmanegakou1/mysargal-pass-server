@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-import os, json, hashlib, zipfile, subprocess, tempfile, requests, shutil
-from flask import Flask, request, jsonify, send_file
+import os, json, hashlib, zipfile, tempfile, requests, re, shutil
+from flask import Flask, jsonify, send_file
 from PIL import Image, ImageDraw
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.serialization import pkcs7
 
 app = Flask(__name__)
 
@@ -43,21 +46,37 @@ def save_images(folder):
     Image.new("RGB", (750, 180), GREEN).save(f"{folder}/strip@2x.png")
 
 def sign_manifest(folder):
-    openssl_cmd = shutil.which("openssl") or "/usr/bin/openssl"
     base = os.path.dirname(os.path.abspath(__file__))
     cert_path = os.path.join(base, "pass-cert-only.pem")
     key_path  = os.path.join(base, "mysargal-pass.key")
     wwdr_path = os.path.join(base, "AppleWWDRCAG4.pem")
-    result = subprocess.run([
-        openssl_cmd, "smime", "-sign", "-binary",
-        "-signer", cert_path, "-inkey", key_path,
-        "-certfile", wwdr_path,
-        "-in", f"{folder}/manifest.json",
-        "-out", f"{folder}/signature",
-        "-outform", "DER"
-    ], capture_output=True)
-    if result.returncode != 0:
-        raise Exception(f"OpenSSL: {result.stderr.decode()[:200]}")
+
+    with open(cert_path, "rb") as f:
+        cert_data = f.read()
+    pem_blocks = re.findall(b"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", cert_data, re.DOTALL)
+    cert = x509.load_pem_x509_certificate(pem_blocks[0])
+
+    with open(wwdr_path, "rb") as f:
+        wwdr_data = f.read()
+    wwdr_blocks = re.findall(b"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", wwdr_data, re.DOTALL)
+    wwdr = x509.load_pem_x509_certificate(wwdr_blocks[0])
+
+    with open(key_path, "rb") as f:
+        private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+    with open(f"{folder}/manifest.json", "rb") as f:
+        manifest_data = f.read()
+
+    signed = (
+        pkcs7.PKCS7SignatureBuilder()
+        .set_data(manifest_data)
+        .add_signer(cert, private_key, hashes.SHA256())
+        .add_certificate(wwdr)
+        .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.DetachedSignature])
+    )
+
+    with open(f"{folder}/signature", "wb") as f:
+        f.write(signed)
     return True
 
 def build_pass(folder, pass_json, out_path):
@@ -85,7 +104,7 @@ def get_merchant(merchant_id):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "openssl": shutil.which("openssl")})
+    return jsonify({"status": "ok"})
 
 @app.route("/passes/<code>.pkpass")
 def generate_pass(code):
@@ -151,27 +170,9 @@ def generate_pass(code):
             build_pass(folder, pass_json, out_path)
             return send_file(out_path, mimetype="application/vnd.apple.pkpass", as_attachment=False, download_name=f"{code}.pkpass")
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()[-500:]}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-@app.route("/debug/<code>")
-def debug_pass(code):
-    try:
-        import traceback
-        with tempfile.TemporaryDirectory() as folder:
-            save_images(folder)
-            r = requests.get(f"{SUPABASE_URL}/rest/v1/gift_cards?code=eq.{code}&select=*", headers=get_headers(), timeout=10)
-            cards = r.json()
-            return jsonify({"cards": cards, "supabase_key_len": len(SUPABASE_KEY), "openssl": shutil.which("openssl")})
-    except Exception as e:
-        return jsonify({"error": str(e), "trace": traceback.format_exc()})
-
-@app.route("/openssl-version")
-def openssl_version():
-    import subprocess, shutil
-    cmd = shutil.which("openssl")
-    r = subprocess.run([cmd, "version"], capture_output=True)
-    return jsonify({"version": r.stdout.decode().strip(), "path": cmd})
