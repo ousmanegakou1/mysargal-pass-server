@@ -156,3 +156,15 @@ def generate_pass(code):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/debug/<code>")
+def debug_pass(code):
+    try:
+        import traceback
+        with tempfile.TemporaryDirectory() as folder:
+            save_images(folder)
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/gift_cards?code=eq.{code}&select=*", headers=get_headers(), timeout=10)
+            cards = r.json()
+            return jsonify({"cards": cards, "supabase_key_len": len(SUPABASE_KEY), "openssl": shutil.which("openssl")})
+    except Exception as e:
+        return jsonify({"error": str(e), "trace": traceback.format_exc()})
