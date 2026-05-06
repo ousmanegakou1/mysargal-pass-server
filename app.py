@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-import os, json, hashlib, zipfile, tempfile, requests, re, shutil
+import os, json, hashlib, zipfile, tempfile, requests, re, shutil, subprocess
 from flask import Flask, jsonify, send_file
 from PIL import Image, ImageDraw
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.serialization import pkcs7
 
 app = Flask(__name__)
 
@@ -46,37 +43,61 @@ def save_images(folder):
     Image.new("RGB", (750, 180), GREEN).save(f"{folder}/strip@2x.png")
 
 def sign_manifest(folder):
+    openssl = shutil.which("openssl") or "/usr/bin/openssl"
     base = os.path.dirname(os.path.abspath(__file__))
+    p12_path  = os.path.join(base, "mysargal-pass.p12")
+    wwdr_path = os.path.join(base, "AppleWWDRCAG4.pem")
+    p12_pass  = "mysargal123"
+
+    # Extraire cert du p12
+    cert_tmp = f"{folder}/cert_tmp.pem"
+    key_tmp  = f"{folder}/key_tmp.pem"
+
+    r1 = subprocess.run([
+        openssl, "pkcs12", "-legacy",
+        "-in", p12_path, "-passin", f"pass:{p12_pass}",
+        "-nokeys", "-clcerts", "-out", cert_tmp
+    ], capture_output=True)
+
+    # Si -legacy echoue, essayer sans
+    if r1.returncode != 0:
+        r1 = subprocess.run([
+            openssl, "pkcs12",
+            "-in", p12_path, "-passin", f"pass:{p12_pass}",
+            "-nokeys", "-clcerts", "-out", cert_tmp
+        ], capture_output=True)
+
+    # Extraire key
+    r2 = subprocess.run([
+        openssl, "pkcs12", "-legacy",
+        "-in", p12_path, "-passin", f"pass:{p12_pass}",
+        "-nocerts", "-nodes", "-out", key_tmp
+    ], capture_output=True)
+
+    if r2.returncode != 0:
+        r2 = subprocess.run([
+            openssl, "pkcs12",
+            "-in", p12_path, "-passin", f"pass:{p12_pass}",
+            "-nocerts", "-nodes", "-out", key_tmp
+        ], capture_output=True)
+
+    # Utiliser pass-cert-only.pem si p12 ne contient pas le bon cert
     cert_path = os.path.join(base, "pass-cert-only.pem")
     key_path  = os.path.join(base, "mysargal-pass.key")
-    wwdr_path = os.path.join(base, "AppleWWDRCAG4.pem")
 
-    with open(cert_path, "rb") as f:
-        cert_data = f.read()
-    pem_blocks = re.findall(b"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", cert_data, re.DOTALL)
-    cert = x509.load_pem_x509_certificate(pem_blocks[0])
+    # Signer
+    result = subprocess.run([
+        openssl, "smime", "-sign", "-binary",
+        "-signer", cert_path,
+        "-inkey", key_path,
+        "-certfile", wwdr_path,
+        "-in", f"{folder}/manifest.json",
+        "-out", f"{folder}/signature",
+        "-outform", "DER"
+    ], capture_output=True)
 
-    with open(wwdr_path, "rb") as f:
-        wwdr_data = f.read()
-    wwdr_blocks = re.findall(b"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", wwdr_data, re.DOTALL)
-    wwdr = x509.load_pem_x509_certificate(wwdr_blocks[0])
-
-    with open(key_path, "rb") as f:
-        private_key = serialization.load_pem_private_key(f.read(), password=None)
-
-    with open(f"{folder}/manifest.json", "rb") as f:
-        manifest_data = f.read()
-
-    signed = (
-        pkcs7.PKCS7SignatureBuilder()
-        .set_data(manifest_data)
-        .add_signer(cert, private_key, hashes.SHA256())
-        .add_certificate(wwdr)
-        .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.DetachedSignature])
-    )
-
-    with open(f"{folder}/signature", "wb") as f:
-        f.write(signed)
+    if result.returncode != 0:
+        raise Exception(f"Sign error: {result.stderr.decode()[:300]}")
     return True
 
 def build_pass(folder, pass_json, out_path):
